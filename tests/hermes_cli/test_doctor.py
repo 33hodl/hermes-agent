@@ -1834,7 +1834,7 @@ def test_docker_daemon_probe_uses_version_not_info(monkeypatch):
 
     doctor_tools._check_docker_backend("docker", False, [])
 
-assert calls == [["/usr/bin/docker", "version"]]
+    assert calls == [["/usr/bin/docker", "version"]]
 
 
 class TestDoctorMemoryFileReadGuard:
@@ -1895,5 +1895,17 @@ class TestDoctorMemoryFileReadGuard:
         out = self._run_doctor_and_capture(monkeypatch, tmp_path)
         assert "MEMORY.md exists but is unreadable" in out
         assert "Permission denied" in out
+        # The loop continued to USER.md after the failed read.
+        assert "USER.md exists" in out
+
+    def test_doctor_warns_on_binary_memory_file(self, monkeypatch, tmp_path):
+        """A corrupt/binary MEMORY.md raises UnicodeDecodeError (a ValueError
+        subclass, not OSError) from read_text(encoding='utf-8'); doctor must
+        warn and continue instead of crashing."""
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, memory_content=b"\xff\xfe\x00binary\x81")
+        assert "MEMORY.md exists but is unreadable" in out
+        # The warning detail must not itself crash on UnicodeDecodeError's
+        # missing .strerror attribute.
+        assert "can't decode" in out or "byte" in out
         # The loop continued to USER.md after the failed read.
         assert "USER.md exists" in out
