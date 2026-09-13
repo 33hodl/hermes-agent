@@ -70,8 +70,12 @@ def is_autonomous_silence_response(response: Any) -> bool:
         return False
     lines = [ln for ln in stripped.splitlines() if ln.strip()]
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
-    return stripped.upper().startswith("[SILENT]") or any(
-        _canonical_silence_candidate(c) in LIVE_GATEWAY_SILENT_MARKERS for c in (stripped, lines[0], lines[-1])
+    # Edge punctuation is stripped here too: models emphasise the sentinel (``**[SILENT]**``), and
+    # delivering it verbatim sends a marker-only message to the user's chat.
+    return _strip_edge_silence_punctuation(stripped).upper().startswith("[SILENT]") or any(
+        c in LIVE_GATEWAY_SILENT_MARKERS
+        for text in (stripped, lines[0], lines[-1])
+        for c in _canonical_silence_candidates(text)
     )
 
 
