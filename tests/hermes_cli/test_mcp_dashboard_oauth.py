@@ -85,7 +85,43 @@ def test_hosted_callback_bypasses_gated_cookie_auth(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert flow._callback == ("abc", "expected")
+    assert flow._callback == ("abc", "expected", None)
+
+
+def test_hosted_callback_threads_rfc9207_iss(monkeypatch):
+    """The hosted callback route must forward RFC 9207 ``iss`` into the flow: the dashboard relay
+    used to drop it, and mcp 2.x rejects an authorization response that omits ``iss`` when the
+    authorization server advertised ``authorization_response_iss_parameter_supported``
+    (Cloudflare, Resend)."""
+    import asyncio
+
+    from starlette.testclient import TestClient
+
+    from hermes_cli import web_server
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-gated-iss",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/reports",
+    )
+    asyncio.run(
+        flow.publish_authorization_url(
+            "https://idp.example/authorize?state=expected"
+        )
+    )
+    _web_server_mcp._mcp_oauth_flows[flow.flow_id] = flow
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+    response = TestClient(web_server.app).get(
+        "/api/mcp/oauth/callback/reports?code=abc&state=expected"
+        "&iss=https%3A%2F%2Fmcp.cloudflare.com"
+    )
+
+    assert response.status_code == 200
+    assert flow._callback == ("abc", "expected", "https://mcp.cloudflare.com")
 
 
 def test_hosted_auth_allows_same_server_name_in_different_profiles(tmp_path, monkeypatch):
@@ -132,7 +168,7 @@ def test_flow_status_does_not_expose_authorization_code():
     )
     flow.authorization_url = "https://idp.example/authorize"
     flow.status = "approved"
-    flow._callback = ("secret-code", "secret-state")
+    flow._callback = ("secret-code", "secret-state", None)
     _web_server_mcp._mcp_oauth_flows[flow.flow_id] = flow
 
     response = _client().get("/api/mcp/oauth/flows/flow-status")
