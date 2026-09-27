@@ -2050,15 +2050,61 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
     return loaded
 
 
-def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_content_on_create: Optional[str] = None) -> None:
+# A payload that drops most of the on-disk top-level keys is the signature of a PARTIAL dict
+# handed to a full-state writer: ``atomic_roundtrip_yaml_save`` DELETES every top-level key
+# absent from *data* ("explicit absence"), so ``{"skills": {...}}`` replaces a 99-key
+# config.yaml with a 1-key file and the user's MCP servers, plugins, dashboard auth, provider
+# pins and proxy settings all vanish (2026-09-27: a maintenance script read the old "merge"
+# docstring as merge semantics and wiped the live config this way). ``config unset`` and every
+# migration pass the FULL document, so they never trip this.
+_BULK_KEY_DROP_MIN = 4      # never trip on a small config
+_BULK_KEY_DROP_RATIO = 0.5  # ... nor on a write that keeps at least half the keys
+
+
+def _refuse_bulk_key_removal(config_path: Path, data: Dict[str, Any]) -> None:
+    """Refuse a write that would delete most of the existing top-level keys.
+
+    The failure is silent and total — the file is replaced with the caller's partial dict, and
+    the next reader sees a valid config that is simply missing everything else. Fail closed
+    with the deleted key names, so the caller can pass the full document instead.
+    """
+    if not isinstance(data, dict):
+        return
+    existing = require_readable_config_before_write(config_path)
+    if len(existing) < _BULK_KEY_DROP_MIN:
+        return
+    removed = sorted(set(existing) - set(data))
+    if len(removed) < _BULK_KEY_DROP_MIN or len(removed) <= len(existing) * _BULK_KEY_DROP_RATIO:
+        return
+    shown = ", ".join(removed[:12]) + (" …" if len(removed) > 12 else "")
+    exc = ValueError(
+        f"payload carries {len(data)} top-level key(s) against {len(existing)} on disk and would "
+        f"delete {len(removed)}: {shown}")
+    raise _refuse_overwrite(
+        config_path, "would lose most of its settings", exc,
+        "Write the COMPLETE config (save_config / save_config_value) instead of a partial dict, "
+        "or pass allow_key_removal=True for a deliberate prune.")
+
+
+def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_content_on_create: Optional[str] = None,
+                        allow_key_removal: bool = False) -> None:
     """THE ``config.yaml`` writer: fail-closed (``require_readable_config_before_write``) and
     comment-preserving (ruamel round-trip merge of *data* onto the on-disk document). Every code
     path that persists a config.yaml — ``save_config``, ``config set``, migrations, plugin
     bookkeeping, gateway/TUI RPCs, auth resets — goes through here; a PyYAML dump of a config
-    path anywhere else is rejected by ``scripts/check_config_yaml_writers.py`` (#92554)."""
+    path anywhere else is rejected by ``scripts/check_config_yaml_writers.py`` (#92554).
+
+    *data* is the COMPLETE desired state, never a patch: ``atomic_roundtrip_yaml_save`` deletes
+    every top-level key absent from it ("explicit absence"), so ``{"skills": {...}}`` turns a
+    99-key config into a 1-key file and the rest of the user's settings are gone. A single-key
+    change must pass the full document (``save_config``) or go through ``save_config_value`` /
+    ``hermes config set``. The bulk-drop guard below refuses the partial-dict wipe; a deliberate
+    prune passes ``allow_key_removal=True``."""
     from utils import atomic_roundtrip_yaml_save
 
     _refuse_failed_read(config_path, data)
+    if not allow_key_removal:
+        _refuse_bulk_key_removal(config_path, data)
     atomic_roundtrip_yaml_save(config_path, data, extra_content_on_create=extra_content_on_create)
 
 

@@ -394,6 +394,53 @@ class TestSaveAndLoadRoundtrip:
         assert config_path.read_text(encoding="utf-8") == original
         assert list((tmp_path / "backups" / "config").glob("config.yaml.corrupt.*"))
 
+    def test_partial_payload_is_refused_and_leaves_config_intact(self, tmp_path):
+        """A partial dict must not silently replace the whole file.
+
+        2026-09-27: a maintenance script called ``atomic_config_write(path, {"skills": ...})``
+        on a 99-key config.yaml; every other top-level key (MCP servers, plugins, dashboard
+        auth, provider pins) was deleted and the file kept 1 key.
+        """
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        original = {
+            "model": {"default": "gpt-4o"},
+            "skills": {"disabled": ["a"]},
+            "mcp_servers": {"x-docs": {"url": "https://docs.x.com/mcp"}},
+            "plugins": {"enabled": ["jev-tool-gate"]},
+            "dashboard": {"basic_auth": {"username": "u"}},
+        }
+        config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="would lose most of its settings"):
+            atomic_config_write(config_path, {"skills": {"disabled": ["a", "b"]}})
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
+
+    def test_partial_payload_allowed_with_explicit_opt_in(self, tmp_path):
+        """A deliberate prune opts in and still replaces the document."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({f"k{i}": i for i in range(10)}), encoding="utf-8")
+
+        atomic_config_write(config_path, {"skills": {"disabled": ["a"]}}, allow_key_removal=True)
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {"skills": {"disabled": ["a"]}}
+
+    def test_full_document_write_still_removes_a_single_key(self, tmp_path):
+        """``config unset`` semantics survive: the full doc minus one key is not a bulk drop."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        full = {f"k{i}": i for i in range(10)}
+        config_path.write_text(yaml.safe_dump(full), encoding="utf-8")
+
+        atomic_config_write(config_path, {k: v for k, v in full.items() if k != "k3"})
+
+        assert "k3" not in yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
 class TestLoadEnvInlineComments:
     def test_unquoted_hash_is_a_comment_quoted_hash_is_data(self, tmp_path):
         """load_env is the one dotenv reader (agent.secret_scope.load_env_file): an unquoted ` #...` tail
