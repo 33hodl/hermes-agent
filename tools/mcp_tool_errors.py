@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import errno
 import importlib
+import inspect
 import logging
 import os
 import re
@@ -336,6 +337,50 @@ _MCP_HTTP_MAX_BODY_BYTES = 10 * 1024 * 1024
 # the lookahead keeps a plain CRLF line ending from backtracking into a \r + \n boundary.
 _SSE_BOUNDARY_RE = re.compile(rb"(?:\r\n|\r(?!\n)|\n){2}")
 _SSE_BOUNDARY_CARRY = 3  # longest boundary ("\r\n\r\n") minus one byte
+
+
+def _sdk_sse_event_size_kwarg(client_fn, limit: int = _MCP_HTTP_MAX_BODY_BYTES) -> dict:
+    """``max_sse_event_size`` kwarg for the MCP SDK's streamable-HTTP client, when it supports one.
+
+    mcp >= 2.3 sizes one SSE event at 1 MiB by default. A server that returns its whole tool catalog
+    in a SINGLE event (Cloudflare's ``tools/list`` is ~4 MB) then never connects:
+    ``SSE stream failed: Server-sent event exceeded the 1048576 byte limit``. Hermes already caps
+    every response body/event at ``_MCP_HTTP_MAX_BODY_BYTES``, so align the SDK with that cap.
+    Empty dict on older SDKs (the cap there is hardcoded; see ``_lift_sdk_sse_event_cap``)."""
+    try:
+        params = inspect.signature(client_fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C callables/wrappers
+        return {}
+    return {"max_sse_event_size": limit} if "max_sse_event_size" in params else {}
+
+
+def _lift_sdk_sse_event_cap(limit: int = _MCP_HTTP_MAX_BODY_BYTES) -> None:
+    """Align the MCP SDK's per-SSE-event cap with Hermes' own wire cap.
+
+    httpx2 >= 2.12 bounds every SSE event at 1 MiB by default, and ``mcp.client.streamable_http``
+    builds ``EventSource(response)`` without overriding it — so a server that answers ``tools/list``
+    with ONE large SSE event (Cloudflare's ~4 MB catalog) fails the handshake with
+    ``Server-sent event exceeded the 1048576 byte limit`` and the server never connects. Hermes
+    already caps every response body/event at ``_MCP_HTTP_MAX_BODY_BYTES`` in
+    ``_make_mcp_body_cap_transport``, so the SDK's much smaller default only costs compatibility.
+    Idempotent; a no-op on SDK builds that do not expose ``EventSource``.
+    """
+    try:
+        import mcp.client.streamable_http as _sdk_streamable_http
+    except Exception:  # pragma: no cover - SDK absent/renamed
+        return
+    base = getattr(_sdk_streamable_http, "EventSource", None)
+    if base is None or getattr(base, "_hermes_event_cap_lifted", False):
+        return
+
+    class _HermesEventSource(base):  # type: ignore[misc, valid-type]
+        _hermes_event_cap_lifted = True
+
+        def __init__(self, response, max_event_size: int | None = limit):
+            super().__init__(response, max_event_size=max_event_size)
+
+    _sdk_streamable_http.EventSource = _HermesEventSource
+
 
 
 def _make_mcp_body_cap_transport(httpx_mod, inner_transport, limit: int = _MCP_HTTP_MAX_BODY_BYTES):

@@ -12,7 +12,14 @@ from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
-from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
+from tools.mcp_tool_errors import (
+    NonMcpEndpointError, _apply_identity_header, _describe_http_failure,
+    _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern,
+    _is_streamable_http_rejection, _lift_sdk_sse_event_cap, _make_http_rejection_recorder,
+    _sdk_sse_event_size_kwarg,
+    _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert,
+    _unwrap_exception_group,
+)
 from tools.mcp_tool_lifecycle import _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids, _stdio_starttimes
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
@@ -521,6 +528,7 @@ class MCPServerTransportMixin:
     def _sse_transport(self, url: str, headers: dict, connect_timeout: float,
                        ssl_verify, client_cert, oauth_auth, strict_cfg_headers: bool):
         """``sse_client`` context manager for ``transport: sse`` entries."""
+        _lift_sdk_sse_event_cap()
         if strict_cfg_headers:  # fail closed: SSE cannot enforce the redirect boundary
             raise ValueError(f"MCP server '{self.name}': strict_redirect_headers is "
                              "not supported on the SSE transport.")
@@ -553,13 +561,15 @@ class MCPServerTransportMixin:
                                    strict_cfg_headers: bool, configured_header_names: set):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
+        _lift_sdk_sse_event_cap()
         if not _core._MCP_NEW_HTTP:
             if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
                                   "enforce the portable redirect-header boundary "
                                   "(strict_redirect_headers). Upgrade the mcp package.")
             return _core.streamablehttp_client(url, headers=headers, timeout=float(connect_timeout), verify=ssl_verify,
-                                               **_present(auth=oauth_auth))
+                                                **_present(auth=oauth_auth),
+                                                **_sdk_sse_event_size_kwarg(_core.streamablehttp_client))
         # Explicit AsyncClient matching the SDK's create_mcp_http_client defaults; MUST come from the
         # SDK's httpx (httpx2 on mcp >= 2.0) since the SDK sends its own Requests through it.
         httpx = _core.sdk_httpx()
@@ -578,13 +588,19 @@ class MCPServerTransportMixin:
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided
             async with _build_client(**client_kwargs) as http_client:
-                async with _core.streamable_http_client(url, http_client=http_client) as streams:
+                async with _core.streamable_http_client(
+                    url, http_client=http_client,
+                    **_sdk_sse_event_size_kwarg(_core.streamable_http_client),
+                ) as streams:
                     yield streams
         return _owned_client_streams()
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
         _core._ensure_mcp_sdk()
+        # httpx2 >= 2.12 caps each SSE event at 1 MiB; lift the SDK default to Hermes' own wire cap
+        # so a server whose tools/list is one big event (Cloudflare ~4 MB) can connect.
+        _lift_sdk_sse_event_cap()
         if not _core._MCP_HTTP_AVAILABLE:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
                               "mcp.client.streamable_http is not available. "
