@@ -429,6 +429,7 @@ class HermesTokenStorage:
     _client_info_path = partialmethod(_path, ".client.json")
     _meta_path = partialmethod(_path, ".meta.json")
     _cimd_rejected_path = partialmethod(_path, ".cimd-off")
+    _reauth_required_path = partialmethod(_path, ".reauth-required")
 
     def _state_paths(self) -> tuple[Path, Path, Path]:
         return self._tokens_path(), self._client_info_path(), self._meta_path()
@@ -497,6 +498,8 @@ class HermesTokenStorage:
             payload["hermes_issuer"] = self._bound_issuer
             self.loaded_issuer = self._bound_issuer
         _write_json(self._tokens_path(), payload)
+        # Fresh credentials: whatever a background attempt failed on no longer describes this pair.
+        self.clear_background_reauth_required()
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
     def bind_issuer(self, issuer: str | None) -> None:
@@ -592,7 +595,7 @@ class HermesTokenStorage:
         # The ``.refresh.lock`` sidecar is deliberately kept: flock is inode-bound, so unlinking it
         # while a peer holds the fence would let the next acquirer lock a fresh inode (two holders).
         for p in (self._tokens_path(), self._client_info_path(), self._cimd_rejected_path(),
-                  *(() if keep_metadata else (self._meta_path(),))):
+                  self._reauth_required_path(), *(() if keep_metadata else (self._meta_path(),))):
             p.unlink(missing_ok=True)
 
     def snapshot(self) -> dict[str, bytes]:
@@ -659,6 +662,40 @@ class HermesTokenStorage:
             else:
                 stamp.append((st.st_mtime_ns, st.st_size, st.st_ino))
         return tuple(stamp)
+
+    def record_background_reauth_required(self) -> None:
+        """Persist that these credentials were proven unusable from a non-interactive context.
+
+        In-process, ``MCPServerTask._arm_auth_park`` already stops discovery passes from replaying a
+        rejected refresh token. Across processes it cannot: every cron/oneshot agent starts with an
+        empty park table, POSTs the same dead refresh token (a guaranteed 400), then enters the
+        authorization-code flow only to be refused by the non-interactive guard — once per server per
+        process, which floods ``errors.log`` with SDK tracebacks and hammers the authorization server.
+        The marker is stamped with ``credential_stamp()``, so any re-authorization (which rewrites the
+        token file) invalidates it without an explicit clear.
+        """
+        stamp = [None if s is None else list(s) for s in self.credential_stamp()]
+        try:
+            _write_json(self._reauth_required_path(), {"stamp": stamp, "at": time.time()})
+        except OSError as exc:  # best effort: the guard still fails safe without the marker
+            logger.debug("Could not record background re-authorization marker for %s: %s", self._server_name, exc)
+
+    def background_reauth_required(self) -> bool:
+        """True when a previous non-interactive attempt failed on *the same* credentials.
+
+        A credential rewrite (interactive ``hermes mcp login``, another Hermes rotating the grant)
+        changes the stamp, so the next connect tries the fresh tokens instead of trusting the marker.
+        """
+        data = _read_json(self._reauth_required_path())
+        if not isinstance(data, dict) or not data.get("stamp"):
+            return False
+        current = [None if s is None else list(s) for s in self.credential_stamp()]
+        return data["stamp"] == current
+
+    def clear_background_reauth_required(self) -> None:
+        """Drop the marker (credentials changed or removal): the next connect starts clean."""
+        with contextlib.suppress(OSError):
+            self._reauth_required_path().unlink(missing_ok=True)
 
 
 # Callback capture: the HTTP listener and the stdin paste reader share one result dict.
@@ -794,7 +831,8 @@ def _announce_authorization_url(
     print(f"  ({note})\n", file=sys.stderr)
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_host: str | None = None):
+def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_host: str | None = None,
+                           storage: "HermesTokenStorage | None" = None):
     """Redirect handler closing over this flow's port (a closure, not ``_oauth_port``, keeps concurrent
     flows isolated). ``redirect_uri`` is a configured proxy callback (None for loopback) and only tailors the
     hint; ``redirect_host`` is the loopback hostname the provider will actually redirect to (see
@@ -816,6 +854,11 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_
         # launching so gateway adapters start promptly and the caller can skip this server with an
         # actionable warning. This intentionally re-checks interactivity here rather than trusting the
         # token-file existence guard alone. See #57836.
+        # Remember the failure against these exact credentials so the NEXT background process parks
+        # before replaying a rejected refresh token and re-entering this flow (see
+        # HermesTokenStorage.record_background_reauth_required).
+        if storage is not None:
+            storage.record_background_reauth_required()
         _raise_if_non_interactive(
             "MCP OAuth requires browser authorization but no interactive session is available (non-interactive/background context)."
         )
@@ -864,7 +907,8 @@ def _callback_outcome(result: dict, cimd_url: str | None):
     return _authorization_code_result(result["auth_code"], result["state"], result.get("iss"))
 
 
-def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float = 300.0):
+def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float = 300.0,
+                          storage: "HermesTokenStorage | None" = None):
     """Callback waiter bound to one flow's port. ``timeout`` is where ``oauth.timeout`` applies (mcp 2.0
     dropped the provider's own). ``cimd_url`` only tailors the timeout message: a server refusing the
     document aborts at the authorization endpoint, so no redirect arrives and a bare "timed out" would
@@ -891,6 +935,8 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         # fast keeps gateway startup independent of an unusable optional MCP server. This guard holds
         # "regardless of whether a token file exists" — the point the build_oauth_auth token-file guard
         # cannot cover. See #57836.
+        if storage is not None:
+            storage.record_background_reauth_required()
         _raise_if_non_interactive(
             "OAuth callback requires an interactive session but none is available (non-interactive/background "
             "context); skipping browser authorization without binding a callback listener.")
@@ -1254,11 +1300,12 @@ def build_oauth_auth(server_name: str, server_url: str, oauth_config: dict | Non
     from tools.mcp_oauth_provider import build_provider_kwargs, prepare_oauth_config
 
     cfg, storage = prepare_oauth_config(server_name, server_url, oauth_config)
-    if not _is_interactive() and not storage.has_cached_tokens():
+    if not _is_interactive() and (not storage.has_cached_tokens() or storage.background_reauth_required()):
         raise OAuthNonInteractiveError(
-            f"MCP OAuth for '{server_name}': non-interactive environment and no cached tokens found. The OAuth flow "
-            f"requires browser authorization. Run `hermes mcp login {server_name}` interactively first to complete "
-            "initial authorization, then cached tokens will be reused.")
+            f"MCP OAuth for '{server_name}': non-interactive environment and "
+            f"{'these cached tokens were already rejected' if storage.has_cached_tokens() else 'no cached tokens found'}. "
+            f"The OAuth flow requires browser authorization. Run `hermes mcp login {server_name}` interactively first "
+            "to complete initial authorization, then cached tokens will be reused.")
     kwargs = build_provider_kwargs(cfg, storage, ssh_proxy_hint=True)
     if HermesOAuthClientProvider is None:
         from tools.mcp_oauth_provider import HermesProviderMixin
