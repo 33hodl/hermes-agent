@@ -453,3 +453,35 @@ class TestRealSSHBackend:
         assert _run(f"wc -c < {shlex.quote(path)}")["output"].strip() == str(len(content.encode()))
         read = json.loads(read_file_tool(path, task_id="ssh_test"))
         assert "beta: ünïcödé ✓" in read["content"], read
+
+
+@requires_ssh
+def test_cleanup_removes_this_session_snapshot_from_the_remote_host():
+    """#141497: cleanup() must delete the session's own artifacts on the remote host —
+    one snapshot per session otherwise piles up in the shared host's /tmp — while
+    leaving another session's files alone."""
+    from tools.environments.ssh import SSHEnvironment
+
+    def remote(*argv):
+        out = subprocess.run(
+            ["ssh", "-i", _SSH_KEY, "-p", str(_SSH_PORT), "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=accept-new", f"{_SSH_USER}@{_SSH_HOST}", *argv],
+            capture_output=True, text=True, timeout=30, check=False)
+        return out.stdout
+
+    # A sibling session's snapshot stands in for the other Hermes sessions on a shared host.
+    sibling = "/tmp/hermes-snap-ffffffffffff.sh"
+    remote(f"printf 'x' > {sibling}")
+
+    env = SSHEnvironment(host=_SSH_HOST, user=_SSH_USER, port=_SSH_PORT,
+                         key_path=_SSH_KEY, timeout=30, sync_files=False, persistent=False)
+    own = env._snapshot_path
+    try:
+        assert own.rsplit("/", 1)[-1] in remote("ls -1 /tmp")
+        env.cleanup()
+        listing = remote("ls -1 /tmp")
+        assert own.rsplit("/", 1)[-1] not in listing
+        assert env._cwd_file.rsplit("/", 1)[-1] not in listing
+        assert sibling.rsplit("/", 1)[-1] in listing
+    finally:
+        remote(f"rm -f {own} {env._cwd_file} {sibling}")

@@ -7,6 +7,7 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 ``base_session_env``, ``base_wait``, ``path_utils``).
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -321,6 +322,33 @@ class BaseEnvironment(ABC):
     def cleanup(self):
         """Release backend resources (container, instance, connection)."""
         ...
+
+    def _remove_session_artifacts(self, *, timeout: float = 5.0) -> None:
+        """Best-effort delete of this session's temp artifacts inside the backend.
+
+        LocalEnvironment unlinks them from the host; a sandboxed backend must run the
+        equivalent before it tears the sandbox down, or one snapshot (plus an interrupted
+        bootstrap's ``.tmp.*``) accumulates per session — #141497 on a shared SSH host.
+        Only paths derived from this session's id are touched, so a backend shared by
+        several sessions loses nobody else's files. Never raises: cleanup must not fail
+        a teardown, and every failure mode here is cosmetic.
+        """
+        snap = shlex.quote(self._snapshot_path)
+        # ``<snap>.tmp.*`` is the atomic-write template a failed bootstrap can leave behind
+        # (mktemp's ``.tmp.XXXXXXXXXX`` suffix); the glob stays unquoted so it expands remotely.
+        cmd = f"rm -f -- {snap} {shlex.quote(self._cwd_file)} {snap}.tmp.*"
+        try:
+            handle = self._run_bash(cmd, timeout=timeout)
+        except Exception:  # teardown is best-effort by contract
+            return
+        try:
+            handle.wait(timeout=timeout)
+        except Exception:
+            with contextlib.suppress(Exception):
+                handle.kill()
+        with contextlib.suppress(Exception):
+            if handle.stdout is not None:
+                handle.stdout.close()
 
     # --- File extraction (backend -> host) ---
     def fetch_file(self, remote_path: str, local_dest: Path, *, max_bytes: int) -> None:

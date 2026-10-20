@@ -61,6 +61,9 @@ class SSHEnvironment(BaseEnvironment):
                  probe_only: bool = False, sync_files: bool = True, persistent: bool = True):
         super().__init__(cwd=cwd, timeout=timeout, persist_env=persistent)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
+        # A probe never runs init_session(), so it has no snapshot to remove and must not
+        # pay an SSH round-trip on teardown.
+        self._is_probe = probe_only
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
@@ -292,6 +295,11 @@ class SSHEnvironment(BaseEnvironment):
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
+        if not self._is_probe:
+            # The remote host is long-lived and shared: delete this session's snapshot and
+            # cwd file there before the ControlMasters go away, or one file per session
+            # piles up in the host's /tmp forever (#141497). Best-effort and bounded.
+            self._remove_session_artifacts()
         for socket in self._control_sockets():
             if not socket.exists():
                 continue

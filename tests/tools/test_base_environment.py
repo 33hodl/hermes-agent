@@ -398,3 +398,41 @@ class TestSanitizeTaskIdForPath:
         )
         target.mkdir(parents=True)
         assert target.is_dir()
+
+
+def test_remove_session_artifacts_targets_only_this_session(monkeypatch):
+    """#141497: the base helper deletes exactly this session's snapshot, cwd file and
+    interrupted-bootstrap ``.tmp.*`` strays — never another session's."""
+    import shlex
+
+    env = _TestableEnv()
+    calls = []
+
+    class _Handle:
+        stdout = None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(env, "_run_bash", lambda cmd, **kw: calls.append((cmd, kw)) or _Handle())
+    env._remove_session_artifacts()
+
+    assert len(calls) == 1
+    cmd, kwargs = calls[0]
+    assert kwargs["timeout"] == 5.0
+    words = shlex.split(cmd)
+    assert words[:3] == ["rm", "-f", "--"]
+    assert env._snapshot_path in words
+    assert env._cwd_file in words
+    assert cmd.endswith(f"{shlex.quote(env._snapshot_path)}.tmp.*") or \
+        f"{shlex.quote(env._snapshot_path)}.tmp.*" in cmd
+
+    # Teardown is best-effort: a dead backend must not fail cleanup.
+    def _boom(cmd, **kw):
+        raise OSError("connection closed")
+
+    monkeypatch.setattr(env, "_run_bash", _boom)
+    env._remove_session_artifacts()
