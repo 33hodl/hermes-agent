@@ -1,5 +1,7 @@
 """Transport-only cron execution; output/delivery remain with the firing scheduler."""
 import asyncio
+import concurrent.futures
+import contextvars
 import hashlib
 import json
 import uuid
@@ -7,6 +9,26 @@ import uuid
 
 class CronExecutionUnknown(RuntimeError):
     """The owner may have accepted this fire; never book it as failed or re-fire."""
+
+
+def _run_off_loop(coro_factory):
+    """Run a canonical fire from a sync caller, even one already sitting on a running loop.
+
+    A tick can fire on the gateway loop itself while the owner is unresolvable (draining for an
+    update, or restarting); ``asyncio.run`` then refuses before any work starts and the caller
+    would book asyncio's own refusal as the job's failure. Offload to a worker thread instead —
+    the same guard as the standalone delivery lane. A fresh thread does not inherit the profile
+    ContextVars (home override + secret scope), so run there in the active context.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(contextvars.copy_context().run, asyncio.run, coro_factory()).result()
+    finally:
+        pool.shutdown(wait=False)
 
 
 def journal_path(job_id, request_id):
@@ -144,7 +166,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 raise RuntimeError('cron synchronous execution must run off the owner event loop')
             return asyncio.run_coroutine_threadsafe(
                 observe(lambda op, data: operation(authority, op, data)), loop).result()
-        return asyncio.run(remote())
+        return _run_off_loop(remote)
     except Exception as exc:
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
