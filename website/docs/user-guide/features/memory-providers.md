@@ -417,21 +417,13 @@ echo "MEM0_API_KEY=your-key" >> ~/.hermes/.env
 **Setup (OSS):**
 ```bash
 hermes memory setup    # select "mem0" → "Open Source (self-hosted)"
-# Or via flags:
-hermes memory setup mem0 --mode oss --oss-llm openai --oss-llm-key sk-... --oss-vector qdrant
 ```
-
-Preview without writing files:
-```bash
-hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
-```
+The prompts choose the OSS components: LLM (openai, ollama), embedder (openai, ollama) and vector store (qdrant, pgvector). `hermes memory setup mem0` runs the same flow for mem0 without the provider picker — `memory setup` accepts no flags beyond the provider name, so a scripted install writes `mem0.json` directly instead of passing `--mode`/`--oss-*` options.
 
 **Setup (Self-Hosted Dashboard):** connect to a Mem0 server you run via Docker (the dashboard's REST API):
 
 ```bash
 hermes memory setup    # select "mem0" → "Self-hosted server"
-# Or via flags:
-hermes memory setup mem0 --mode selfhosted --host http://localhost:8888 --api-key your-admin-api-key
 ```
 
 Or configure manually — either as env vars:
@@ -468,7 +460,7 @@ The plugin authenticates with `X-API-Key` and uses the server's `/search` / `/me
 | Embedder | openai, ollama |
 | Vector Store | qdrant (local/server), pgvector |
 
-**Switching modes:** Re-run `hermes memory setup mem0 --mode <platform|selfhosted|oss>` or edit `mem0.json` directly.
+**Switching modes:** Re-run `hermes memory setup` (or `hermes memory setup mem0`) and choose the new mode in the prompts, or edit `mem0.json` directly.
 
 ### Migrating from bundled Mem0
 
