@@ -147,6 +147,27 @@ def _disk_full(candidate: Any) -> bool:
         return False
 
 
+# A cause line is one line of already-user-facing text (an exception message or a
+# provider body), bounded so a multi-page traceback string cannot become the card body.
+_CAUSE_MAX_CHARS = 300
+
+
+def cause_line(exc: BaseException) -> str:
+    """The one plain line a failure card can show when the cause is already known (#147620).
+
+    A local-runtime failure (``gateway`` layer) has no per-code copy on the clients: they render
+    the layer body, which names no cause — the reason staff have to open a diagnostics bundle for
+    text the backend already held. Collapses whitespace (tracebacks and provider bodies arrive
+    multi-line), keeps the exception type so a bare ``KeyError: 'history'`` reads as one, and
+    bounds the length. Empty when there is nothing worth showing, so the client keeps its copy.
+    """
+    text = " ".join(str(exc).split())
+    kind = type(exc).__name__
+    if not text:
+        return kind[: _CAUSE_MAX_CHARS]
+    return (text if text.startswith(kind) else f"{kind}: {text}")[:_CAUSE_MAX_CHARS].rstrip()
+
+
 def _result_layer(reason: str, error_text: str, provider: str) -> str:
     if reason in _REASON_TO_LAYER:
         return _REASON_TO_LAYER[reason]
@@ -234,7 +255,14 @@ def build_error_surface_from_exception(
             return _surface(LAYER_DISK, "disk_full", False, provider, model)
         api_like = (type(exc).__module__ or "").split(".")[0] in _API_EXC_MODULE_PREFIXES or hasattr(exc, "status_code")
         if not api_like or not isinstance(exc, Exception):
-            return _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
+            surface = _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
+            # The gateway layer has no per-code client copy, so the card renders the layer body
+            # ("Hermes hit a problem") and the real cause — which this exception already holds —
+            # never reaches the user (#147620). The code is the exception class, so the clients'
+            # layer fallback shows `message` as the card body.
+            if cause := cause_line(exc):
+                surface["message"] = cause
+            return surface
 
         from agent.error_classifier import classify_api_error
 

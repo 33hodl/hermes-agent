@@ -109,8 +109,12 @@ export interface ErrorSurface {
    *  (OPENAI_API_KEY). Deep-links Settings → Keys to that row. Absent from
    *  older backends. */
   apiKeyEnv?: string
-  /** Free-tier codes: the backend's own plain sentence for this failure (it
-   *  names the wait, the model, the way forward). Shown as the card body. */
+  /** The backend's own plain sentence for this failure, shown as the card body.
+   *  Free-tier codes: it names the wait, the model, the way forward.
+   *  Gateway layer (local runtime failure): one line of the real cause (the
+   *  exception, e.g. "ValueError: compression model context 8123 < 64000"), so
+   *  the card is not just "Hermes hit a problem". Absent for provider codes,
+   *  which have their own copy. */
   message?: string
   /** Epoch seconds when the provider said its limit lifts (Retry-After header /
    *  `resets_at` body field on a 429). Rendered as "Limit resets at HH:mm" next

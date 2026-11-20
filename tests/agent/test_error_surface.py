@@ -301,3 +301,35 @@ def test_rate_limit_reset_rides_the_surface():
 
     bare = _rate_limit({}, {"error": {"message": "Rate limit exceeded"}})
     assert "resets_at" not in build_error_surface_from_exception(bare, provider="openai", model="gpt-5")
+
+
+def test_gateway_layer_failure_carries_one_line_of_the_cause():
+    """#147620: a local-runtime (gateway layer) failure has no per-code client copy — the card
+    renders the layer body, so the cause the backend already held must ride in ``message`` as one
+    plain line (collapsed, type-qualified, bounded), never a multi-line traceback."""
+    surface = build_error_surface_from_exception(
+        ValueError("compression model context 8123 < 64000\n  (fallback picked an 8k model)")
+    )
+
+    assert surface["layer"] == LAYER_GATEWAY and surface["code"] == "ValueError"
+    assert surface["message"] == (
+        "ValueError: compression model context 8123 < 64000 (fallback picked an 8k model)"
+    )
+
+    # A message-less exception still names something, and the line is bounded.
+    assert build_error_surface_from_exception(KeyError())["message"] == "KeyError"
+    long = build_error_surface_from_exception(RuntimeError("x" * 5_000))["message"]
+    assert len(long) <= 300 and long.startswith("RuntimeError: xxx")
+
+
+def test_cause_line_stays_off_layers_that_have_their_own_copy():
+    """The narrow class: only the gateway layer (where clients fall back to layer copy) gains
+    ``message``. Provider/billing/auth descriptors keep their exact shape — those codes have
+    dedicated client copy, so a cause line there would be dead surface."""
+    class FakeAPIError(Exception):
+        status_code = 429
+
+    assert "message" not in build_error_surface_from_exception(
+        FakeAPIError("rate limited"), provider="openrouter"
+    )
+    assert "message" not in build_error_surface_from_result(_failed_result("rate_limit"))
