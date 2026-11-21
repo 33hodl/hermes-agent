@@ -206,11 +206,32 @@ _build_daytona_env = functools.partial(_build_sandbox_env, "daytona")
 _build_vercel_env = functools.partial(_build_sandbox_env, "vercel_sandbox")
 
 
+def _terminal_config() -> dict:
+    """``config.yaml`` ``terminal`` section, or {} when it cannot be read.
+
+    Read per call (not cached) so a config edit takes effect on the next terminal session
+    without a gateway restart, matching ``_sync_back_max_bytes`` in tools/environments/file_sync.py.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return ((load_config() or {}).get("terminal") or {})
+    except Exception:  # a config read must never take the terminal tool down
+        return {}
+
+
 def _build_ssh_env(*, cwd, timeout, ssh_config, probe_only=False, **_):
     if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
         raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
+    # ``terminal.ssh_sync_files`` (default true) mirrors the host's .hermes tree to/from the
+    # remote before/after commands. Turn it off when the remote is not a throwaway sandbox but
+    # a host that already holds the files (a self-hosted VPS, or a backend pointed at this very
+    # machine): every sync then tars the ENTIRE remote ~/.hermes -- 4 GB here -- inside the
+    # gateway's own event loop, which stalls /api/status past the watchdog window and drops
+    # every Desktop websocket. Files reachable on both sides make the copy pure cost.
+    sync_files = bool(_terminal_config().get("ssh_sync_files", True))
     return _SSHEnvironment(host=ssh_config["host"], user=ssh_config["user"], port=ssh_config.get("port", 22),
                            key_path=ssh_config.get("key", ""), cwd=cwd, timeout=timeout, probe_only=probe_only,
+                           sync_files=sync_files,
                            persistent=ssh_config.get("persistent", True))
 
 
